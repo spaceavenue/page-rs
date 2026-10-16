@@ -1,8 +1,10 @@
 use std::fs::File;
-use std::io::{self, Read};
+use std::io::{self, Read, stdin};
 use std::path::Path;
+use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::thread;
 
-use anyhow::Context;
+use anyhow::{Context, bail};
 use memchr::memchr_iter;
 use memmap2::{Mmap, MmapOptions};
 
@@ -10,6 +12,16 @@ use crate::cli::Input;
 
 /// Files below ~64KiB are faster to load using `read()` instead of `mmap()`-ing them.
 const MMAP_THRESHOLD: usize = 64 * 1024; // 64 KiB
+
+/// Newline indexing heuristic.
+const AVG_BYTES_PER_LINE: usize = 40;
+
+/// Read stdin in growing chunks to minimize syscall overhead.
+const STDIN_MIN_CHUNK: usize = 8 * 1024;
+const STDIN_MAX_CHUNK: usize = 256 * 1024;
+
+/// How much to stream ahead of current line before blockign the pipe.
+const STDIN_CHANNEL_CAPACITY: usize = 32;
 
 pub enum BufferSource {
   Mmap(Mmap),
@@ -29,8 +41,9 @@ impl BufferSource {
 pub struct Buffer {
   source: BufferSource,
   line_offsets: Vec<usize>,
+  indexed_line: usize,
   filename: String,
-  size: usize,
+  stdin_rx: Option<Receiver<io::Result<Vec<u8>>>>,
 }
 
 impl Buffer {
@@ -60,7 +73,6 @@ impl Buffer {
       BufferSource::Mmap(mmap)
     };
 
-    let line_offsets = Self::index_lines(source.as_slice());
     let filename = path
       .file_name()
       .and_then(|f| f.to_str())
@@ -69,29 +81,57 @@ impl Buffer {
 
     Ok(Self {
       source,
-      line_offsets,
+      line_offsets: vec![0],
+      indexed_line: 0,
       filename,
-      size,
+      stdin_rx: None,
     })
   }
 
   /// Load bytes from stdin.
   pub fn from_stdin() -> anyhow::Result<Self> {
-    let mut stdin = io::stdin().lock();
-    let mut data = Vec::with_capacity(64 * 1024);
-    stdin.read_to_end(&mut data)?;
-    drop(stdin);
-
-    let size = data.len();
-    let source = BufferSource::Heap(data);
-    let line_offsets = Self::index_lines(source.as_slice());
+    let (tx, rx) = mpsc::sync_channel(STDIN_CHANNEL_CAPACITY);
+    Self::spawn_stdin_reader(tx)?;
 
     Ok(Self {
-      source,
-      line_offsets,
+      source: BufferSource::Heap(Vec::with_capacity(STDIN_MIN_CHUNK * 4)),
+      line_offsets: vec![0],
+      indexed_line: 0,
       filename: "[stdin]".to_string(),
-      size,
+      stdin_rx: Some(rx),
     })
+  }
+
+  fn spawn_stdin_reader(tx: SyncSender<io::Result<Vec<u8>>>) -> anyhow::Result<()> {
+    let spawned = thread::Builder::new()
+      .name("stdin_reader".into())
+      .spawn(move || {
+        let mut stdin = io::stdin().lock();
+        let mut chunk_size = STDIN_MIN_CHUNK;
+        loop {
+          let mut chunk = vec![0u8; chunk_size];
+          match stdin.read(&mut chunk) {
+            Ok(0) => break, // EOF
+            Ok(n) => {
+              chunk.truncate(n);
+              if tx.send(Ok(chunk)).is_err() {
+                break;
+              }
+              chunk_size = (chunk_size * 2).min(STDIN_MAX_CHUNK);
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => {
+              let _ = tx.send(Err(e));
+              break;
+            }
+          }
+        }
+      });
+
+    match spawned {
+      Ok(_) => return Ok(()),
+      Err(e) => bail!("failed to spawn stdin reader thread: {e}"),
+    }
   }
 
   /// Newline indexing.
@@ -101,7 +141,7 @@ impl Buffer {
     }
 
     // Heuristic: ~40 bytes per line average
-    let mut offsets = Vec::with_capacity(bytes.len() / 40 + 1);
+    let mut offsets = Vec::with_capacity(bytes.len().saturating_div(AVG_BYTES_PER_LINE + 1));
     offsets.push(0);
 
     memchr_iter(b'\n', bytes)
