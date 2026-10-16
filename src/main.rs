@@ -1,6 +1,7 @@
 use crate::buffer::Buffer;
 use crate::terminal::TerminalGuard;
 
+mod action;
 mod buffer;
 mod cli;
 mod terminal;
