@@ -1,6 +1,7 @@
 use std::fs::File;
 use std::io::{self, Read, stdin};
 use std::path::Path;
+use std::ptr::slice_from_raw_parts;
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::thread;
 
@@ -12,9 +13,6 @@ use crate::cli::Input;
 
 /// Files below ~64KiB are faster to load using `read()` instead of `mmap()`-ing them.
 const MMAP_THRESHOLD: usize = 64 * 1024; // 64 KiB
-
-/// Newline indexing heuristic.
-const AVG_BYTES_PER_LINE: usize = 40;
 
 /// Read stdin in growing chunks to minimize syscall overhead.
 const STDIN_MIN_CHUNK: usize = 8 * 1024;
@@ -41,7 +39,7 @@ impl BufferSource {
 pub struct Buffer {
   source: BufferSource,
   line_offsets: Vec<usize>,
-  indexed_line: usize,
+  scanned: usize,
   filename: String,
   stdin_rx: Option<Receiver<io::Result<Vec<u8>>>>,
 }
@@ -82,7 +80,7 @@ impl Buffer {
     Ok(Self {
       source,
       line_offsets: vec![0],
-      indexed_line: 0,
+      scanned: 0,
       filename,
       stdin_rx: None,
     })
@@ -96,7 +94,7 @@ impl Buffer {
     Ok(Self {
       source: BufferSource::Heap(Vec::with_capacity(STDIN_MIN_CHUNK * 4)),
       line_offsets: vec![0],
-      indexed_line: 0,
+      scanned: 0,
       filename: "[stdin]".to_string(),
       stdin_rx: Some(rx),
     })
@@ -129,25 +127,62 @@ impl Buffer {
       });
 
     match spawned {
-      Ok(_) => return Ok(()),
+      Ok(_) => Ok(()),
       Err(e) => bail!("failed to spawn stdin reader thread: {e}"),
     }
   }
 
-  /// Newline indexing.
-  fn index_lines(bytes: &[u8]) -> Vec<usize> {
-    if bytes.is_empty() {
-      return vec![0];
+  pub fn is_streaming(&self) -> bool {
+    self.stdin_rx.is_some()
+  }
+
+  pub fn index_till_line(&mut self, target_line: usize) {
+    if self.line_offsets.len() > target_line {
+      return;
     }
 
-    // Heuristic: ~40 bytes per line average
-    let mut offsets = Vec::with_capacity(bytes.len().saturating_div(AVG_BYTES_PER_LINE + 1));
-    offsets.push(0);
+    let bytes = self.source.as_slice();
+    let start = self.scanned;
 
-    memchr_iter(b'\n', bytes)
-      .filter(|p| *p + 1 < bytes.len())
-      .for_each(|p| offsets.push(p + 1));
+    for pos in memchr_iter(b'\n', &bytes[start..]) {
+      self.line_offsets.push(start + pos);
+      if self.line_offsets.len() > target_line {
+        self.scanned = start + pos + 1;
+        return;
+      }
+    }
 
-    offsets
+    self.scanned = bytes.len();
+  }
+
+  fn at_eof(&self) -> bool {
+    !self.is_streaming() && self.scanned >= self.source.as_slice().len()
+  }
+
+  pub fn line_count(&self) -> usize {
+    let tail_start = self.line_offsets.last().map_or(0, |&newline| newline + 1);
+    let unterminated_tail = self.at_eof() && tail_start < self.source.as_slice().len();
+    self.line_offsets.len() + usize::from(unterminated_tail)
+  }
+
+  pub fn line_range(&self, line: usize) -> Option<(usize, usize)> {
+    let start = match line.checked_sub(1) {
+      Some(prev) => *&self.line_offsets.get(prev)? + 1,
+      None => 0,
+    };
+
+    let len = self.source.as_slice().len();
+    let end = match self.line_offsets.get(line) {
+      Some(&newline) => newline,
+      None if self.at_eof() && start < len => len,
+      None => return None,
+    };
+
+    Some((start, end))
+  }
+
+  pub fn line_bytes(&self, line: usize) -> Option<&[u8]> {
+    let (start, end) = self.line_range(line)?;
+    Some(&self.source.as_slice()[start..end])
   }
 }
