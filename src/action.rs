@@ -15,7 +15,7 @@ pub enum Action {
 }
 
 const KEYMAP: &[(KeyCode, KeyModifiers, Action)] = {
-  use KeyCode::*;
+  use KeyCode::{Char, Down, End, Enter, Esc, Home, PageDown, PageUp, Up};
   use KeyModifiers as Mod;
 
   &[

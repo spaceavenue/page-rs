@@ -1,7 +1,6 @@
 use std::fs::File;
-use std::io::{self, Read, stdin};
+use std::io::{self, Read};
 use std::path::Path;
-use std::ptr::slice_from_raw_parts;
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::thread;
 
@@ -79,7 +78,7 @@ impl Buffer {
 
     Ok(Self {
       source,
-      line_offsets: vec![0],
+      line_offsets: Vec::new(),
       scanned: 0,
       filename,
       stdin_rx: None,
@@ -93,7 +92,7 @@ impl Buffer {
 
     Ok(Self {
       source: BufferSource::Heap(Vec::with_capacity(STDIN_MIN_CHUNK * 4)),
-      line_offsets: vec![0],
+      line_offsets: Vec::new(),
       scanned: 0,
       filename: "[stdin]".to_string(),
       stdin_rx: Some(rx),
@@ -132,6 +131,35 @@ impl Buffer {
     }
   }
 
+  pub fn read_from_stdin(&mut self) -> anyhow::Result<bool> {
+    let Some(rx) = self.stdin_rx.as_ref() else {
+      return Ok(false);
+    };
+
+    let mut received = false;
+    loop {
+      match rx.try_recv() {
+        Ok(Ok(chunk)) => {
+          if let BufferSource::Heap(buf) = &mut self.source {
+            buf.extend_from_slice(&chunk);
+          }
+          received = true;
+        }
+        Ok(Err(e)) => {
+          self.stdin_rx = None;
+          return Err(e).context("error reading from stdin");
+        }
+        Err(mpsc::TryRecvError::Empty) => break,
+        Err(mpsc::TryRecvError::Disconnected) => {
+          self.stdin_rx = None;
+          break;
+        }
+      }
+    }
+
+    Ok(received)
+  }
+
   pub fn is_streaming(&self) -> bool {
     self.stdin_rx.is_some()
   }
@@ -159,6 +187,10 @@ impl Buffer {
     !self.is_streaming() && self.scanned >= self.source.as_slice().len()
   }
 
+  pub fn filename(&self) -> &str {
+    &self.filename
+  }
+
   pub fn line_count(&self) -> usize {
     let tail_start = self.line_offsets.last().map_or(0, |&newline| newline + 1);
     let unterminated_tail = self.at_eof() && tail_start < self.source.as_slice().len();
@@ -167,7 +199,7 @@ impl Buffer {
 
   pub fn line_range(&self, line: usize) -> Option<(usize, usize)> {
     let start = match line.checked_sub(1) {
-      Some(prev) => *&self.line_offsets.get(prev)? + 1,
+      Some(prev) => self.line_offsets.get(prev)? + 1,
       None => 0,
     };
 
@@ -184,5 +216,50 @@ impl Buffer {
   pub fn line_bytes(&self, line: usize) -> Option<&[u8]> {
     let (start, end) = self.line_range(line)?;
     Some(&self.source.as_slice()[start..end])
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  fn buffer_from(contents: &[u8]) -> Buffer {
+    Buffer {
+      source: BufferSource::Heap(contents.to_vec()),
+      line_offsets: Vec::new(),
+      scanned: 0,
+      filename: "test".to_string(),
+      stdin_rx: None,
+    }
+  }
+
+  #[test]
+  fn indexing_through_a_line_makes_that_line_readable() {
+    let mut buf = buffer_from(b"hello\nworld\n");
+    buf.index_till_line(1);
+    assert_eq!(buf.line_bytes(0), Some(&b"hello"[..]));
+    assert_eq!(buf.line_bytes(1), Some(&b"world"[..]));
+    assert_eq!(buf.line_bytes(2), None);
+    assert_eq!(buf.line_count(), 2);
+  }
+
+  #[test]
+  fn line_range_first_character_preserved() {
+    let mut buf = buffer_from(b"first line\nsecond line\n");
+    buf.index_till_line(1);
+    assert_eq!(buf.line_range(0), Some((0, 10)));
+    assert_eq!(buf.line_bytes(0), Some(&b"first line"[..]));
+    assert_eq!(buf.line_range(1), Some((11, 22)));
+    assert_eq!(buf.line_bytes(1), Some(&b"second line"[..]));
+  }
+
+  #[test]
+  fn unterminated_last_line_is_readable() {
+    let mut buf = buffer_from(b"a\nb\nc");
+    buf.index_till_line(2);
+    assert_eq!(buf.line_bytes(0), Some(&b"a"[..]));
+    assert_eq!(buf.line_bytes(1), Some(&b"b"[..]));
+    assert_eq!(buf.line_bytes(2), Some(&b"c"[..]));
+    assert_eq!(buf.line_count(), 3);
   }
 }
